@@ -1,3 +1,8 @@
+# Independent fork: Home Assistant AI Task
+
+This fork adds a generic provider for existing Home Assistant AI Task entities.
+See [setup, requirements and limitations (English / Deutsch)](AI_TASK.md).
+
 <p align="center">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="./logos/dark_logo@2x.png">

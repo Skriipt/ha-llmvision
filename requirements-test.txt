@@ -38,6 +38,10 @@ aiofile==3.9.0
 pillow==12.0.0
 numpy==2.3.2
 homeassistant==2025.11.2
+# Native AI Task tests import HA's conversation and camera integrations.
+hassil==3.4.0
+home-assistant-intents==2025.11.7
+PyTurboJPEG==1.8.0
 voluptuous==0.15.2
 voluptuous-openapi==0.1.0
 voluptuous-serialize==2.7.0

@@ -13,6 +13,9 @@ import json
 import base64
 from .const import (
     DOMAIN,
+    PROVIDER_AI_TASK,
+    CONF_AI_TASK_ENTITY,
+    AI_TASK_MODEL,
     CONF_API_KEY,
     CONF_PROVIDER,
     CONF_IP_ADDRESS,
@@ -120,6 +123,7 @@ class Request:
                 return default_model
 
         return {
+            PROVIDER_AI_TASK: AI_TASK_MODEL,
             "OpenAI": DEFAULT_OPENAI_MODEL,
             "Azure": DEFAULT_AZURE_MODEL,
             "Anthropic": DEFAULT_ANTHROPIC_MODEL,
@@ -170,7 +174,11 @@ class Request:
         if provider_name is None:
             raise ServiceValidationError("invalid_provider")
         # Ensure model defaults are respected
-        call.model = getattr(call, "model", None) or self.get_default_model(entry_id)
+        if provider_name == PROVIDER_AI_TASK:
+            # Ignore blueprint model overrides, including Glimpse postprocessing.
+            call.model = AI_TASK_MODEL
+        else:
+            call.model = getattr(call, "model", None) or self.get_default_model(entry_id)
         call.temperature = config.get(CONF_TEMPERATURE, 0.5)
         call.top_p = config.get(CONF_TOP_P, 0.9)
         call.base64_images = self.base64_images
@@ -2182,6 +2190,11 @@ class ProviderFactory:
     def create(
         hass: HomeAssistant, provider_name: str, config: dict, model: str
     ) -> Provider:
+        if provider_name == PROVIDER_AI_TASK:
+            from .ai_task_provider import HomeAssistantAITask
+
+            return HomeAssistantAITask(hass, config.get(CONF_AI_TASK_ENTITY))
+
         if provider_name == "OpenAI":
             return OpenAI(
                 hass=hass,
