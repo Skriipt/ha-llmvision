@@ -19,6 +19,8 @@ from .providers import (
 )
 from .const import (
     DOMAIN,
+    PROVIDER_AI_TASK,
+    CONF_AI_TASK_ENTITY,
     CONF_PROVIDER,
     CONF_API_KEY,
     CONF_IP_ADDRESS,
@@ -77,6 +79,7 @@ class llmvisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def handle_provider(self, provider):
         provider_steps = {
+            PROVIDER_AI_TASK: self.async_step_ai_task,
             "Settings": self.async_step_settings,
             "Anthropic": self.async_step_anthropic,
             "AWS Bedrock": self.async_step_aws_bedrock,
@@ -119,6 +122,7 @@ class llmvisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     {
                         "select": {
                             "options": [
+                                PROVIDER_AI_TASK,
                                 "Anthropic",
                                 "AWS Bedrock",
                                 "Azure",
@@ -149,6 +153,59 @@ class llmvisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user", data_schema=data_schema, description_placeholders=user_input
+        )
+
+    async def async_step_ai_task(self, user_input=None):
+        """Select an existing AI Task without making a billable model call."""
+        from .ai_task_provider import HomeAssistantAITask
+
+        data_schema = vol.Schema(
+            {
+                vol.Required(CONF_AI_TASK_ENTITY): selector(
+                    {
+                        "entity": {
+                            "filter": {
+                                "domain": "ai_task",
+                                "supported_features": [
+                                    [
+                                        "ai_task.AITaskEntityFeature.GENERATE_DATA",
+                                        "ai_task.AITaskEntityFeature.SUPPORT_ATTACHMENTS",
+                                    ]
+                                ],
+                            }
+                        }
+                    }
+                )
+            }
+        )
+        if self.source == config_entries.SOURCE_RECONFIGURE:
+            data_schema = self.add_suggested_values_to_schema(
+                data_schema, self._get_reconfigure_entry().data
+            )
+
+        errors = {}
+        if user_input is not None:
+            try:
+                await HomeAssistantAITask(
+                    self.hass, user_input[CONF_AI_TASK_ENTITY]
+                ).validate()
+            except ServiceValidationError as err:
+                errors[CONF_AI_TASK_ENTITY] = str(err)
+            else:
+                data = {
+                    CONF_PROVIDER: PROVIDER_AI_TASK,
+                    CONF_AI_TASK_ENTITY: user_input[CONF_AI_TASK_ENTITY],
+                }
+                if self.source == config_entries.SOURCE_RECONFIGURE:
+                    return self.async_update_reload_and_abort(
+                        self._get_reconfigure_entry(), data_updates=data
+                    )
+                return self.async_create_entry(
+                    title=f"{PROVIDER_AI_TASK} ({data[CONF_AI_TASK_ENTITY]})", data=data
+                )
+
+        return self.async_show_form(
+            step_id="ai_task", data_schema=data_schema, errors=errors
         )
 
     async def async_step_localai(self, user_input=None):

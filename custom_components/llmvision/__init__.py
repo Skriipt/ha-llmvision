@@ -19,6 +19,7 @@ import logging
 from .const import (
     DOMAIN,
     CONF_PROVIDER,
+    CONF_AI_TASK_ENTITY,
     CONF_API_KEY,
     CONF_IP_ADDRESS,
     CONF_PORT,
@@ -93,6 +94,7 @@ async def async_setup_entry(hass, entry):
     # Build a standardized config dict with only generic keys
     provider_config = {
         CONF_PROVIDER: entry.data.get(CONF_PROVIDER),
+        CONF_AI_TASK_ENTITY: entry.data.get(CONF_AI_TASK_ENTITY),
         CONF_API_KEY: entry.data.get(CONF_API_KEY),
         CONF_IP_ADDRESS: entry.data.get(CONF_IP_ADDRESS),
         CONF_PORT: entry.data.get(CONF_PORT),

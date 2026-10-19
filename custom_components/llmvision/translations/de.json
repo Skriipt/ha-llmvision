@@ -1,6 +1,13 @@
 {
     "config": {
         "step": {
+            "ai_task": {
+                "title": "Home Assistant AI Task",
+                "description": "Wähle eine eingerichtete AI-Task-Entität mit Datengenerierung und Bildanhängen. Modell und Sampling werden in deren Integration eingestellt. LLM-Vision-Modell, max_tokens und temperature gelten hier nicht. Nur Textausgabe; JSON-Schema wird nicht unterstützt.",
+                "data": {
+                    "ai_task_entity": "AI-Task-Entität"
+                }
+            },
             "user": {
                 "title": "LLM Vision Konfiguration",
                 "description": "Wähle den Anbieter, den du einrichten möchtest."
@@ -419,6 +426,10 @@
             }
         },
         "error": {
+            "ai_task_invalid_entity": "Wähle eine ai_task-Entität.",
+            "ai_task_missing_entity": "Die gewählte AI-Task-Entität existiert nicht.",
+            "ai_task_unavailable": "Die gewählte AI-Task-Entität ist nicht verfügbar.",
+            "ai_task_missing_features": "Die Entität muss Datengenerierung und Anhänge unterstützen.",
             "handshake_failed": "Verbindung zum Server konnte nicht hergestellt werden. Überprüfe deinen API-Key oder IP und Port.",
             "empty_api_key": "Ungültiger API-Key",
             "invalid_provider": "Ungültiger Anbieter ausgewählt",

@@ -5,6 +5,10 @@ DOMAIN = "llmvision"
 
 # CONFIGURABLE VARIABLES FOR SETUP
 CONF_PROVIDER = "provider"
+PROVIDER_AI_TASK = "Home Assistant AI Task"
+CONF_AI_TASK_ENTITY = "ai_task_entity"
+# Internal routing value only; AI Task owns the actual model configuration.
+AI_TASK_MODEL = "home-assistant-ai-task"
 CONF_API_KEY = "api_key"
 CONF_IP_ADDRESS = "ip_address"
 CONF_PORT = "port"
