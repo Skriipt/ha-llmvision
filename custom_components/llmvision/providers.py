@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from copy import copy
 from aiohttp import ClientTimeout
 import boto3
 from homeassistant.exceptions import ServiceValidationError
@@ -158,10 +159,8 @@ class Request:
         if not call.provider:
             raise ServiceValidationError(ERROR_NOT_CONFIGURED)
 
-    async def call(self, call: Any, _is_fallback_retry: bool = False):
-        """
-        Forwards a request to the specified provider and optionally generates a title.
-        """
+    def _prepare_provider(self, call: Any, *, vision: bool = True):
+        """Apply this provider's defaults without invoking either request stage."""
         entry_id = call.provider
         domain_data = self.hass.data.get(DOMAIN) or {}
         config = domain_data.get(entry_id)
@@ -181,21 +180,10 @@ class Request:
             call.model = getattr(call, "model", None) or self.get_default_model(entry_id)
         call.temperature = config.get(CONF_TEMPERATURE, 0.5)
         call.top_p = config.get(CONF_TOP_P, 0.9)
-        call.base64_images = self.base64_images
-        call.filenames = self.filenames
-
-        self.validate(call)
-
-        # Get fallback provider from settings
-        settings_entry = None
-        for entry in self.hass.config_entries.async_entries(DOMAIN):
-            if entry.data.get("provider") == "Settings":
-                settings_entry = entry.data
-                break
-        fallback_provider = (
-            settings_entry.get("fallback_provider", None) if settings_entry else None
-        )
-        _LOGGER.debug("Fallback provider: %s", fallback_provider)
+        if vision:
+            call.base64_images = self.base64_images
+            call.filenames = self.filenames
+            self.validate(call)
 
         # Instantiate via factory
         if not isinstance(call.model, str):
@@ -210,6 +198,23 @@ class Request:
         except Exception as e:
             _LOGGER.error(f"Provider factory failed for {provider_name}: {e}")
             raise ServiceValidationError("invalid_provider")
+
+        return provider_name, provider_instance
+
+    async def call(self, call: Any, _is_fallback_retry: bool = False):
+        """Analyze images, then optionally title the completed analysis."""
+        provider_name, provider_instance = self._prepare_provider(call)
+
+        # Get fallback provider from settings
+        settings_entry = None
+        for entry in self.hass.config_entries.async_entries(DOMAIN):
+            if entry.data.get("provider") == "Settings":
+                settings_entry = entry.data
+                break
+        fallback_provider = (
+            settings_entry.get("fallback_provider", None) if settings_entry else None
+        )
+        _LOGGER.debug("Fallback provider: %s", fallback_provider)
 
         try:
             # Make call to provider
@@ -256,23 +261,29 @@ class Request:
             pass
 
         gen_title = None
+        title_pattern = r"[^a-zA-Z0-9À-ÖØ-öø-ɏ\s]"
+        title_call = copy(call)
         try:
             # For structured output, extract title from JSON response if title_field is specified
             if call.response_format == "json" and call.title_field:
                 try:
                     response_json = json.loads(response_text)
                     gen_title = response_json.get(call.title_field)
-                except (json.JSONDecodeError, AttributeError):
-                    # If JSON parsing fails or title_field not found, gen_title remains None
-                    pass
+                    if gen_title is not None:
+                        gen_title = re.sub(title_pattern, "", gen_title)
+                except (json.JSONDecodeError, AttributeError, TypeError):
+                    # Invalid/missing titles must not discard the structured result.
+                    gen_title = None
             # For non-structured output, use traditional title generation
             elif call.generate_title and call.response_format != "json":
-                call.message = (
+                title_call.message = (
                     call.memory.title_prompt
                     + "Create a title for this text: "
                     + response_text
                 )
-                gen_title = await provider_instance.title_request(call)
+                gen_title = re.sub(
+                    title_pattern, "", await provider_instance.title_request(title_call)
+                )
         except Exception as e:
             _LOGGER.error(f"Provider {provider_name} failed to generate title: {e}")
             # Try fallback if configured and not already tried
@@ -283,15 +294,22 @@ class Request:
                 and fallback_provider != call.provider
             ):
                 _LOGGER.info(f"Trying fallback provider for title: {fallback_provider}")
-                call.provider = fallback_provider
-                call.model = None
-                return await self.call(call, _is_fallback_retry=True)
+                try:
+                    title_call.provider = fallback_provider
+                    title_call.model = None
+                    _, title_provider = self._prepare_provider(title_call, vision=False)
+                    gen_title = re.sub(
+                        title_pattern, "", await title_provider.title_request(title_call)
+                    )
+                except Exception as fallback_error:
+                    _LOGGER.error("Title fallback failed: %s", fallback_error)
+                    gen_title = "Event Detected"
             else:
                 gen_title = "Event Detected"
 
         result = {}
         if gen_title is not None:
-            result["title"] = re.sub(r"[^a-zA-Z0-9À-ÖØ-öø-ɏ\s]", "", gen_title)
+            result["title"] = gen_title
         result["response_text"] = response_text
 
         # Handle structured response if requested

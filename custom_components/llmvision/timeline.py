@@ -5,6 +5,7 @@ import uuid
 import os, re
 import json
 import asyncio
+import stat
 from .const import DOMAIN, CONF_RETENTION_TIME, CONF_TIMELINE_LANGUAGE
 from homeassistant.util import dt as dt_util
 from homeassistant.core import HomeAssistant
@@ -208,7 +209,10 @@ class Timeline:
 
         # Track key_frame paths whose DB rows are not yet committed
         self._pending_key_frames: set[str] = set()
-        self._cleanup_lock = asyncio.Lock()
+        # API views create separate Timeline instances for the same database.
+        self._cleanup_lock = hass.data.setdefault(
+            f"{DOMAIN}_timeline_cleanup_lock", asyncio.Lock()
+        )
         self._config_entry = config_entry
         self._migrating = True
 
@@ -584,13 +588,15 @@ class Timeline:
         return (await _get_category_and_label(self.hass, self._config_entry, label))[0]
 
     async def get_linked_images(self):
-        """Returns the filenames of key_frames associated with events"""
-        await self.load_events()
-        return [
-            os.path.basename(e.key_frame)
-            for e in self.events
-            if getattr(e, "key_frame", None)
-        ]
+        """Returns linked filenames, propagating read errors to cleanup."""
+        await self._purge_expired_events()
+        async with aiosqlite.connect(self._db_path) as db:
+            async with db.execute("SELECT key_frame FROM events") as cursor:
+                rows = await cursor.fetchall()
+        # Resolve aliases too, so a symlink reference protects its owned target.
+        return await self.hass.async_add_executor_job(
+            lambda: [os.path.basename(os.path.realpath(row[0])) for row in rows if row[0]]
+        )
 
     async def load_events(self):
         """Loads events from the database into memory"""
@@ -875,6 +881,7 @@ class Timeline:
                 await self.load_events()
         except aiosqlite.Error as e:
             _LOGGER.error(f"Error inserting event into database: {e}")
+            raise
 
     async def update_event(
         self,
@@ -900,7 +907,7 @@ class Timeline:
         end = dt_util.as_local(end)
 
         try:
-            async with aiosqlite.connect(self._db_path) as db:
+            async with self._cleanup_lock, aiosqlite.connect(self._db_path) as db:
                 _LOGGER.info(f"Updating event with UID {uid}")
                 await db.execute(
                     """
@@ -924,46 +931,100 @@ class Timeline:
                 await self.load_events()
         except aiosqlite.Error as e:
             _LOGGER.error(f"Error updating event in database: {e}")
+            raise
 
-    async def delete_event(
-        self,
-        uid: str,
-    ) -> bool:
-        """Deletes an event from the calendar."""
-        _LOGGER.info(f"Deleting event with UID: {uid}")
+    def _remove_snapshot(self, key_frame: str, references=(), min_age: int = 0) -> bool:
+        """Unlink only a regular owned snapshot; run in the executor.
 
-        async def _delete_event_from_db(uid: str) -> bool:
-            """Deletes an event from the database"""
-            try:
-                async with aiosqlite.connect(self._db_path) as db:
-                    await db.execute("DELETE FROM events WHERE uid = ?", (uid,))
-                    await db.commit()
-            except aiosqlite.Error as e:
-                _LOGGER.error(f"Error deleting event from database: {e}")
+        Stored paths remain metadata. Never reinterpret an external/relative path
+        as an owned filename, or follow a symlink to delete its target. Directory
+        descriptors keep the final unlink anchored even if a path is swapped.
+        """
+        if not isinstance(key_frame, str) or not os.path.isabs(key_frame):
+            return False
+        root = os.path.abspath(self._media_path)
+        path = os.path.abspath(key_frame)
+        if path == root or os.path.commonpath((root, path)) != root:
+            return False
+        if os.path.realpath(root) != root or os.path.realpath(key_frame) != path:
+            return False
+        if any(
+            isinstance(ref, str) and os.path.isabs(ref)
+            and os.path.realpath(ref) == path
+            for ref in references
+        ):
+            return False
+
+        directory = os.open(os.path.sep, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in os.path.dirname(path).split(os.path.sep):
+                if not part:
+                    continue
+                child = os.open(
+                    part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory,
+                )
+                os.close(directory)
+                directory = child
+            name = os.path.basename(path)
+            info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode):
                 return False
+            if min_age and datetime.datetime.now().timestamp() - info.st_mtime < min_age:
+                return False
+            os.unlink(name, dir_fd=directory)
             return True
+        finally:
+            os.close(directory)
 
-        async def _delete_image(uid: str) -> bool:
-            """Deletes the image associated with the event"""
+    async def _async_remove_snapshot(self, *args) -> bool:
+        """Keep the caller's cleanup lock until the filesystem worker stops."""
+        job = asyncio.ensure_future(
+            self.hass.async_add_executor_job(self._remove_snapshot, *args)
+        )
+        try:
+            return await asyncio.shield(job)
+        except asyncio.CancelledError:
+            # Cancelling an executor future cannot stop an already running unlink.
+            # Drain it before releasing the lock, including repeated cancellation.
+            while not job.done():
+                try:
+                    await asyncio.shield(job)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if not job.cancelled():
+                job.exception()  # Retrieve worker errors while preserving cancellation.
+            raise
+
+    async def delete_event(self, uid: str) -> bool:
+        """Delete the row, then best-effort cleanup of its unreferenced snapshot."""
+        _LOGGER.info("Deleting event with UID: %s", uid)
+        async with self._cleanup_lock:
             try:
                 async with aiosqlite.connect(self._db_path) as db:
                     async with db.execute(
                         "SELECT key_frame FROM events WHERE uid = ?", (uid,)
                     ) as cursor:
-                        key_frame = await cursor.fetchone()
-                        if key_frame:
-                            key_frame = key_frame[0]
-                            if os.path.exists(key_frame) and f"/{DOMAIN}/" in key_frame:
-                                os.remove(key_frame)
-                                _LOGGER.info(f"Deleted image: {key_frame}")
+                        row = await cursor.fetchone()
+                    await db.execute("DELETE FROM events WHERE uid = ?", (uid,))
+                    async with db.execute("SELECT key_frame FROM events") as cursor:
+                        references = [item[0] for item in await cursor.fetchall()]
+                    await db.commit()
             except aiosqlite.Error as e:
-                _LOGGER.error(f"Error deleting image: {e}")
+                _LOGGER.error("Error deleting event from database: %s", e)
                 return False
-            return True
 
-        success_image = await _delete_image(uid)
-        success_event = await _delete_event_from_db(uid)
-        return success_image and success_event
+            if row and row[0]:
+                try:
+                    await self._async_remove_snapshot(row[0], references)
+                except FileNotFoundError:
+                    pass
+                except (OSError, ValueError) as e:
+                    # The event is already committed; cleanup can be retried later.
+                    _LOGGER.warning("Could not remove snapshot %s: %s", row[0], e)
+            return True
 
     async def _cleanup(self):
         """Deletes images not associated with any events.
@@ -979,10 +1040,14 @@ class Timeline:
         GRACE_SECONDS = 30
 
         async with self._cleanup_lock:
-            linked_frames = {
-                (os.path.basename(n) or "").lower()
-                for n in await self.get_linked_images()
-            }
+            try:
+                linked_frames = {
+                    (os.path.basename(n) or "").lower()
+                    for n in await self.get_linked_images()
+                }
+            except (aiosqlite.Error, OSError, ValueError) as e:
+                _LOGGER.warning("Skipping snapshot cleanup: %s", e)
+                return
 
             # List files in snapshots dir (in executor, non-blocking)
             try:
@@ -992,38 +1057,20 @@ class Timeline:
             except FileNotFoundError:
                 return
 
-            now_ts = datetime.datetime.now().timestamp()
             removed = 0
 
             for file in files:
                 file_path = os.path.join(self._media_path, file)
-                is_file = await self.hass.async_add_executor_job(
-                    os.path.isfile, file_path
-                )
-                if not is_file:
-                    continue
-
                 base = (file or "").lower()
 
                 # Protect if linked to an event or pending
                 if base in linked_frames or base in self._pending_key_frames:
                     continue
 
-                # Protect new files (grace window)
                 try:
-                    mtime = await self.hass.async_add_executor_job(
-                        os.path.getmtime, file_path
-                    )
-                    if (now_ts - mtime) < GRACE_SECONDS:
-                        continue
-                except OSError:
-                    continue
-
-                _LOGGER.info(f"[CLEANUP] Removing unlinked snapshot: {file}")
-                try:
-                    await self.hass.async_add_executor_job(os.remove, file_path)
-                    removed += 1
-                except OSError as e:
+                    if await self._async_remove_snapshot(file_path, (), GRACE_SECONDS):
+                        removed += 1
+                except (OSError, ValueError) as e:
                     _LOGGER.warning(f"[CLEANUP] Failed to remove {file_path}: {e}")
 
             if removed:

@@ -603,3 +603,18 @@ class TestTimelineEventView:
 
         assert response.status == 200
         assert _response_payload(response) == {"event_id": "event-1", "status": "updated"}
+
+
+@pytest.mark.asyncio
+async def test_delete_false_is_http_failure(mock_hass, mock_config_entry):
+    timeline = Mock()
+    timeline.delete_event = AsyncMock(return_value=False)
+    with patch(
+        "custom_components.llmvision.api.async_get_settings_entry",
+        new=AsyncMock(return_value=mock_config_entry),
+    ), patch("custom_components.llmvision.api.Timeline", return_value=timeline), patch(
+        "custom_components.llmvision.api.async_dispatcher_send"
+    ) as dispatch:
+        response = await TimelineEventView().delete(_make_request(mock_hass), "event-1")
+    assert response.status == 500
+    dispatch.assert_not_called()
