@@ -1223,3 +1223,321 @@ class TestMigration:
         cleanup_mock.assert_awaited_once()
         assert await tl._get_db_version() == DB_VERSION
         assert not tl._migrating
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outside", [False, True], ids=["owned", "outside"])
+async def test_delete_snapshot_boundary(build_timeline, tmp_path, outside):
+    """An absolute owned snapshot is removed; an API-supplied outside path is not."""
+    tl = build_timeline()
+    await tl._initialize_db()
+    root = tmp_path / "llmvision" / "snapshots"
+    root.mkdir(parents=True)
+    tl._media_path = str(root)
+    image = (root.parent if outside else root) / "frame.jpg"
+    image.write_bytes(b"synthetic snapshot")
+    row = _make_row("delete me", 0, key_frame=str(image))
+    await _insert_rows(tl._db_path, [row])
+
+    assert await tl.delete_event(row[0]) is True
+    assert image.exists() is outside
+    assert await _fetch_titles(tl._db_path) == []
+
+
+@pytest.fixture
+async def snapshot_timeline(build_timeline, tmp_path):
+    tl = build_timeline()
+    await tl._initialize_db()
+    root = tmp_path / "llmvision" / "snapshots"
+    root.mkdir(parents=True)
+    tl._media_path = str(root)
+    return tl, root
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [
+    "normalized", "parent_inside", "parent_outside", "prefix_sibling",
+    "relative", "leaf_symlink", "internal_symlink", "directory_symlink",
+    "root_symlink", "missing", "dangling", "directory", "empty",
+])
+async def test_snapshot_path_variants(snapshot_timeline, tmp_path, kind):
+    tl, root = snapshot_timeline
+    image = root / "frame.jpg"
+    image.write_bytes(b"owned")
+    external = root.parent / "private.jpg"
+    external.write_bytes(b"external")
+    path = str(image)
+    should_remove = kind in {"normalized", "parent_inside"}
+    if kind == "normalized":
+        path = f"{root}//./frame.jpg"
+    elif kind == "parent_inside":
+        (root / "child").mkdir()
+        path = f"{root}/child/../frame.jpg"
+    elif kind == "parent_outside":
+        path = f"{root}/../private.jpg"
+    elif kind == "prefix_sibling":
+        sibling = root.with_name("snapshots-other")
+        sibling.mkdir()
+        external = sibling / "private.jpg"
+        external.write_bytes(b"external")
+        path = str(external)
+    elif kind == "relative":
+        path = os.path.relpath(image)
+    elif kind in {"leaf_symlink", "internal_symlink", "dangling"}:
+        link = root / "link.jpg"
+        link.symlink_to(image if kind == "internal_symlink" else external)
+        if kind == "dangling":
+            external.unlink()
+        path = str(link)
+    elif kind == "directory_symlink":
+        (root / "escape").symlink_to(root.parent, target_is_directory=True)
+        path = str(root / "escape" / "private.jpg")
+    elif kind == "root_symlink":
+        moved = root.with_name("real-snapshots")
+        root.rename(moved)
+        root.symlink_to(moved, target_is_directory=True)
+    elif kind == "missing":
+        path = str(root / "missing.jpg")
+    elif kind == "directory":
+        path = str(root)
+    elif kind == "empty":
+        path = ""
+    row = _make_row("delete me", 0, key_frame=path)
+    await _insert_rows(tl._db_path, [row])
+
+    assert await tl.delete_event(row[0]) is True
+    assert image.exists() is not should_remove
+    if kind != "dangling":
+        assert external.read_bytes() == b"external"
+    if kind in {"leaf_symlink", "internal_symlink", "dangling"}:
+        assert link.is_symlink()
+    assert await _fetch_titles(tl._db_path) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alias", ["exact", "normalized", "symlink"])
+async def test_delete_preserves_shared_snapshot(snapshot_timeline, alias):
+    tl, root = snapshot_timeline
+    image = root / "shared.jpg"
+    image.write_bytes(b"shared")
+    other_path = str(image)
+    if alias == "normalized":
+        other_path = f"{root}/./shared.jpg"
+    elif alias == "symlink":
+        link = root / "alias.jpg"
+        link.symlink_to(image)
+        other_path = str(link)
+    first = _make_row("first", 0, key_frame=str(image))
+    second = _make_row("second", 0, key_frame=other_path)
+    await _insert_rows(tl._db_path, [first, second])
+
+    assert await tl.delete_event(first[0]) is True
+    assert image.exists()
+    # Orphan cleanup must also recognize aliases used by remaining events.
+    os.utime(image, (0, 0))
+    await tl._cleanup()
+    assert image.exists()
+    assert await tl.delete_event(second[0]) is True
+    if alias != "symlink":
+        assert not image.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["insert", "delete"])
+async def test_database_failure_keeps_snapshot(snapshot_timeline, operation):
+    tl, root = snapshot_timeline
+    image = root / "keep.jpg"
+    image.write_bytes(b"keep")
+    row = _make_row("keep", 0, key_frame=str(image))
+    await _insert_rows(tl._db_path, [row])
+    async with aiosqlite.connect(tl._db_path) as db:
+        await db.execute(f"""CREATE TRIGGER reject_write BEFORE {operation.upper()} ON events
+            BEGIN SELECT RAISE(ABORT, 'synthetic database failure'); END""")
+        await db.commit()
+
+    if operation == "delete":
+        assert await tl.delete_event(row[0]) is False
+    else:
+        with pytest.raises(aiosqlite.Error, match="synthetic database failure"):
+            await tl.create_event(
+                start=dt_util.utcnow(), end=dt_util.utcnow(), title="new",
+                description="", key_frame=str(image), camera_name="",
+            )
+        assert tl._pending_key_frames == set()
+    assert image.read_bytes() == b"keep"
+    assert await _fetch_titles(tl._db_path) == ["keep"]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_does_not_delete_on_database_read_error(snapshot_timeline):
+    tl, root = snapshot_timeline
+    image = root / "keep.jpg"
+    image.write_bytes(b"keep")
+    os.utime(image, (0, 0))
+    async with aiosqlite.connect(tl._db_path) as db:
+        await db.execute("DROP TABLE events")
+        await db.commit()
+    await tl._cleanup()
+    assert image.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["insert", "delete", "update"])
+async def test_real_database_failure_reaches_api(snapshot_timeline, monkeypatch, operation):
+    from custom_components.llmvision import api
+
+    tl, root = snapshot_timeline
+    image = root / "keep.jpg"
+    image.write_bytes(b"keep")
+    row = _make_row("keep", 0, key_frame=str(image))
+    await _insert_rows(tl._db_path, [row])
+    async with aiosqlite.connect(tl._db_path) as db:
+        await db.execute(f"""CREATE TRIGGER reject_write BEFORE {operation.upper()} ON events
+            BEGIN SELECT RAISE(ABORT, 'synthetic database failure'); END""")
+        await db.commit()
+    monkeypatch.setattr(api, "Timeline", lambda *args: tl)
+    monkeypatch.setattr(api, "async_get_settings_entry", AsyncMock(return_value=tl._config_entry))
+    dispatch = Mock()
+    monkeypatch.setattr(api, "async_dispatcher_send", dispatch)
+    request = Mock(app={"hass": tl.hass})
+    request.json = AsyncMock(return_value={"title": "new", "key_frame": str(image)})
+
+    if operation == "delete":
+        response = await api.TimelineEventView().delete(request, row[0])
+    elif operation == "update":
+        response = await api.TimelineEventView().post(request, row[0])
+    else:
+        response = await api.TimelineEventCreateView().post(request)
+    assert response.status == 500
+    dispatch.assert_not_called()
+    assert image.read_bytes() == b"keep"
+    assert await _fetch_titles(tl._db_path) == ["keep"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_insert_protects_shared_image(snapshot_timeline):
+    import asyncio
+
+    writer, root = snapshot_timeline
+    image = root / "shared.jpg"
+    image.write_bytes(b"shared")
+    row = _make_row("first", 0, key_frame=str(image))
+    await _insert_rows(writer._db_path, [row])
+    deleter = Timeline(writer.hass, writer._config_entry)
+    deleter._media_path = str(root)
+    entered, proceed = asyncio.Event(), asyncio.Event()
+    real_insert = writer._insert_event
+
+    async def paused_insert(event):
+        entered.set()
+        await proceed.wait()
+        await real_insert(event)
+
+    writer._insert_event = paused_insert
+    insert = asyncio.create_task(writer.create_event(
+        start=dt_util.utcnow(), end=dt_util.utcnow(), title="second",
+        description="", key_frame=str(image), camera_name="",
+    ))
+    await entered.wait()
+    delete = asyncio.create_task(deleter.delete_event(row[0]))
+    try:
+        await asyncio.sleep(0)
+        assert not delete.done()
+    finally:
+        proceed.set()
+        await asyncio.gather(insert, delete)
+    assert delete.result() is True
+    assert image.exists()
+    assert await _fetch_titles(writer._db_path) == ["second"]
+
+
+@pytest.mark.asyncio
+async def test_directory_swap_cannot_redirect_unlink(snapshot_timeline, monkeypatch):
+    """Even a symlink swap after normalization cannot redirect the unlink."""
+    tl, root = snapshot_timeline
+    image = root / "frame.jpg"
+    image.write_bytes(b"owned")
+    outside = root.parent / "outside"
+    outside.mkdir()
+    external = outside / image.name
+    external.write_bytes(b"external")
+    row = _make_row("delete me", 0, key_frame=str(image))
+    await _insert_rows(tl._db_path, [row])
+    real_open = os.open
+    swapped = False
+
+    def swapping_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if path == root.name and kwargs.get("dir_fd") is not None and not swapped:
+            root.rename(root.with_name("original"))
+            root.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swapping_open)
+    assert await tl.delete_event(row[0]) is True
+    assert swapped
+    assert external.read_bytes() == b"external"
+    assert (root.with_name("original") / image.name).read_bytes() == b"owned"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_preserves_symlinks(snapshot_timeline):
+    tl, root = snapshot_timeline
+    external = root.parent / "private.jpg"
+    external.write_bytes(b"external")
+    os.utime(external, (0, 0))
+    link = root / "link.jpg"
+    link.symlink_to(external)
+    await tl._cleanup()
+    assert link.is_symlink()
+    assert external.read_bytes() == b"external"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["delete", "cleanup"])
+@pytest.mark.parametrize("worker_error", [False, True])
+async def test_cancelled_delete_keeps_lock_until_unlink_finishes(snapshot_timeline, operation, worker_error):
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event as ThreadEvent
+
+    tl, root = snapshot_timeline
+    image = root / "shared.jpg"
+    image.write_bytes(b"owned")
+    row = _make_row("first", 0, key_frame=str(image))
+    if operation == "delete":
+        await _insert_rows(tl._db_path, [row])
+    os.utime(image, (0, 0))
+    entered, proceed = ThreadEvent(), ThreadEvent()
+    remove = tl._remove_snapshot
+
+    def paused_remove(*args):
+        entered.set()
+        assert proceed.wait(timeout=5)
+        if worker_error:
+            raise OSError("synthetic unlink failure")
+        return remove(*args)
+
+    tl._remove_snapshot = paused_remove
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        tl.hass.async_add_executor_job = lambda func, *args: asyncio.get_running_loop().run_in_executor(pool, func, *args)
+        deletion = asyncio.create_task(
+            tl.delete_event(row[0]) if operation == "delete" else tl._cleanup()
+        )
+        try:
+            async with asyncio.timeout(5):
+                while not entered.is_set():
+                    await asyncio.sleep(0.001)
+            deletion.cancel()
+            await asyncio.sleep(0)
+            # A new Timeline request must not enter until the worker is finished.
+            assert tl._cleanup_lock.locked()
+            deletion.cancel()  # Repeated cancellation must not release it either.
+            await asyncio.sleep(0)
+            assert tl._cleanup_lock.locked()
+        finally:
+            proceed.set()
+            with pytest.raises(asyncio.CancelledError):
+                await deletion
+        assert not tl._cleanup_lock.locked()

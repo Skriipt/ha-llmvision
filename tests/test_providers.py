@@ -2058,7 +2058,7 @@ async def test_request_call_error_and_title_fallback_branches(
     )
     assert "title" not in result
 
-    # Title generation fallback to another provider hits recursive title fallback branch.
+    # Title generation fallback keeps the completed analysis.
     coverage_hass.config_entries.async_entries.return_value = [
         SimpleNamespace(
             data={"provider": "Settings", "fallback_provider": "provider_openai"}
@@ -2075,7 +2075,7 @@ async def test_request_call_error_and_title_fallback_branches(
         )
     )
     assert result["title"] == "Title2"
-    assert result["response_text"] == "body2"
+    assert result["response_text"] == "body1"
 
 
 def test_heal_json_extra_branches(mock_hass):
@@ -2694,3 +2694,186 @@ def test_anthropic_unsupported_model_omits_disabled_thinking_parameter(coverage_
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.asyncio
+async def test_title_fallback_preserves_analysis_and_prompt(coverage_hass, monkeypatch):
+    """A failed title must never repeat vision or replace its successful result."""
+    req = Request(coverage_hass, "original request", 64, 0.5)
+    req.add_frame("aW1n", "cam.jpg")
+    call_obj = make_coverage_call(provider="provider_groq", generate_title=True)
+    primary = DummyProvider(response_text="original analysis", fail_title=True)
+    fallback = DummyProvider(response_text="wrong second analysis", title_text="Visitor")
+    primary.vision_request = AsyncMock(wraps=primary.vision_request)
+    fallback.vision_request = AsyncMock(wraps=fallback.vision_request)
+    fallback.title_request = AsyncMock(wraps=fallback.title_request)
+    providers = iter([primary, fallback])
+    monkeypatch.setattr(ProviderFactory, "create", lambda **kwargs: next(providers))
+
+    result = await req.call(call_obj)
+
+    assert result == {"response_text": "original analysis", "title": "Visitor"}
+    primary.vision_request.assert_awaited_once()
+    fallback.vision_request.assert_not_awaited()
+    assert fallback.title_request.await_args.args[0].message == (
+        "tp:Create a title for this text: original analysis"
+    )
+    assert call_obj.message == "hello"
+    assert call_obj.provider == "provider_groq"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [
+    "success", "disabled", "no_settings", "same_provider", "missing_config",
+    "factory_failure", "title_failure", "ai_task", "groq_multiple_images",
+])
+async def test_title_fallback_failures_are_optional(coverage_hass, monkeypatch, mode):
+    """Title-only failure cannot discard successful vision, even for stale settings."""
+    from custom_components.llmvision.const import PROVIDER_AI_TASK, AI_TASK_MODEL
+
+    primary_id, fallback_id = "provider_groq", "provider_openai"
+    if mode == "disabled":
+        fallback_id = "no_fallback"
+    elif mode == "no_settings":
+        coverage_hass.config_entries.async_entries.return_value = []
+    elif mode == "same_provider":
+        fallback_id = primary_id
+    elif mode == "missing_config":
+        fallback_id = "removed-provider"
+    elif mode == "ai_task":
+        coverage_hass.data[DOMAIN][fallback_id][CONF_PROVIDER] = PROVIDER_AI_TASK
+        coverage_hass.data[DOMAIN][fallback_id][CONF_DEFAULT_MODEL] = "glimpse-v1"
+    elif mode == "groq_multiple_images":
+        primary_id, fallback_id = fallback_id, primary_id
+    if mode != "no_settings":
+        coverage_hass.config_entries.async_entries.return_value = [
+            SimpleNamespace(data={"provider": "Settings", "fallback_provider": fallback_id})
+        ]
+
+    vision_inputs, title_inputs, factory_inputs = [], [], []
+
+    class RecordingProvider(DummyProvider):
+        async def vision_request(self, call):
+            vision_inputs.append((call.provider, call.message))
+            return "completed analysis"
+
+        async def title_request(self, call):
+            title_inputs.append((call.provider, call.message, call.model, call.temperature))
+            call.max_tokens = 4096  # The real base provider mutates this field too.
+            if call.provider == primary_id or mode == "title_failure":
+                raise RuntimeError("synthetic title failure")
+            return "Fallback title!"
+
+    def factory(**kwargs):
+        factory_inputs.append(kwargs)
+        if len(factory_inputs) == 2 and mode == "factory_failure":
+            raise RuntimeError("synthetic factory failure")
+        return RecordingProvider()
+
+    monkeypatch.setattr(ProviderFactory, "create", factory)
+    req = Request(coverage_hass, "hello", 64, 0.5)
+    req.add_frame("aW1n", "cam.jpg")
+    if mode == "groq_multiple_images":
+        req.add_frame("aW1n", "cam2.jpg")
+    call_obj = make_coverage_call(provider=primary_id, generate_title=True)
+    result = await req.call(call_obj)
+
+    successful_title = mode in {"success", "ai_task", "groq_multiple_images"}
+    assert result == {
+        "response_text": "completed analysis",
+        "title": "Fallback title" if successful_title else "Event Detected",
+    }
+    assert vision_inputs == [(primary_id, "hello")]
+    assert call_obj.message == "hello"
+    assert call_obj.max_tokens == 64
+    assert call_obj.provider == primary_id
+    assert all(item[1] == "tp:Create a title for this text: completed analysis" for item in title_inputs)
+    assert len(factory_inputs) <= 2
+    if successful_title:
+        expected_model = AI_TASK_MODEL if mode == "ai_task" else req.get_default_model(fallback_id)
+        assert title_inputs[-1][2] == expected_model
+        assert title_inputs[-1][3] == coverage_hass.data[DOMAIN][fallback_id].get(CONF_TEMPERATURE, 0.5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["success", "title_failure", "vision_failure", "missing_config", "disabled"])
+async def test_vision_fallback_keeps_original_request(coverage_hass, monkeypatch, mode):
+    fallback_id = "provider_openai"
+    if mode == "missing_config":
+        fallback_id = "removed-provider"
+    elif mode == "disabled":
+        fallback_id = "no_fallback"
+    coverage_hass.config_entries.async_entries.return_value = [
+        SimpleNamespace(data={"provider": "Settings", "fallback_provider": fallback_id})
+    ]
+    seen = []
+
+    class RecordingProvider(DummyProvider):
+        async def vision_request(self, call):
+            seen.append(("vision", call.provider, call.message))
+            if call.provider == "provider_groq" or mode == "vision_failure":
+                raise RuntimeError("synthetic vision failure")
+            return "fallback analysis"
+
+        async def title_request(self, call):
+            seen.append(("title", call.provider, call.message))
+            if mode == "title_failure":
+                raise RuntimeError("synthetic title failure")
+            return "Title"
+
+    monkeypatch.setattr(ProviderFactory, "create", lambda **kwargs: RecordingProvider())
+    req = Request(coverage_hass, "hello", 64, 0.5)
+    req.add_frame("aW1n", "cam.jpg")
+    call_obj = make_coverage_call(provider="provider_groq", generate_title=True)
+    if mode in {"vision_failure", "missing_config", "disabled"}:
+        with pytest.raises(ServiceValidationError):
+            await req.call(call_obj)
+        assert not any(item[0] == "title" for item in seen)
+    else:
+        result = await req.call(call_obj)
+        assert result == {"response_text": "fallback analysis", "title": "Event Detected" if mode == "title_failure" else "Title"}
+        assert seen[-1] == ("title", "provider_openai", "tp:Create a title for this text: fallback analysis")
+    vision_calls = [item for item in seen if item[0] == "vision"]
+    assert len(vision_calls) == (1 if mode in {"disabled", "missing_config"} else 2)
+    assert all(item[2] == "hello" for item in vision_calls)
+    assert call_obj.message == "hello"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_title", [None, [], {"title": "unexpected"}, 123])
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_malformed_title_keeps_completed_analysis(coverage_hass, monkeypatch, bad_title, fallback):
+    primary = DummyProvider(response_text="completed analysis", title_text=bad_title, fail_title=fallback)
+    secondary = DummyProvider(title_text=bad_title)
+    primary.vision_request = AsyncMock(wraps=primary.vision_request)
+    secondary.vision_request = AsyncMock(wraps=secondary.vision_request)
+    providers = iter([primary, secondary])
+    monkeypatch.setattr(ProviderFactory, "create", lambda **kwargs: next(providers))
+    req = Request(coverage_hass, "hello", 64, 0.5)
+    req.add_frame("aW1n", "cam.jpg")
+    call_obj = make_coverage_call(
+        provider="provider_groq" if fallback else "provider_openai", generate_title=True
+    )
+    result = await req.call(call_obj)
+    assert result == {"response_text": "completed analysis", "title": "Event Detected"}
+    assert call_obj.message == "hello"
+    primary.vision_request.assert_awaited_once()
+    secondary.vision_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("title", [None, [], 123, "Valid! Title"])
+async def test_structured_title_cannot_discard_response(coverage_hass, monkeypatch, title):
+    response = {"name": title, "description": "completed analysis"}
+    provider = DummyProvider(response_text=json.dumps(response))
+    provider.title_request = AsyncMock(wraps=provider.title_request)
+    monkeypatch.setattr(ProviderFactory, "create", lambda **kwargs: provider)
+    req = Request(coverage_hass, "hello", 64, 0.5)
+    req.add_frame("aW1n", "cam.jpg")
+    result = await req.call(make_coverage_call(response_format="json", title_field="name"))
+    assert result["structured_response"] == response
+    if isinstance(title, str):
+        assert result["title"] == "Valid Title"
+    else:
+        assert "title" not in result
+    provider.title_request.assert_not_awaited()
